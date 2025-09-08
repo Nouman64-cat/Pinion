@@ -1,79 +1,93 @@
 # Pinion
 
-Pinion is a minimal, in‑memory job queue and worker for Python, built around a pluggable storage interface, a simple task registry, and a retry policy with exponential backoff. The current implementation lives in `skepticqueue/v1.py`.
+Pinion is a tiny, pluggable job queue and worker for Python. It provides a simple `@task` registry, an in-memory queue for quick starts, and a durable SQLite backend for cross-process work, plus a retry policy with exponential backoff.
 
 ## Features
 
-- In‑memory queue with thread-safe condition variable coordination
+- In-memory queue with thread-safe `Condition` coordination
+- Durable SQLite storage with atomic job claim (WAL) across processes
 - Pluggable `Storage` protocol (SPI) for custom backends
-- Task registry via `@task` decorator (case‑insensitive names)
-- Worker loop with polling and graceful stop
-- Exponential backoff retries (configurable attempts and base delay)
-- Basic job lifecycle tracking (`PENDING`, `RUNNING`, `SUCCESS`, `FAILED`)
+- Task registry via `@task` decorator (case-insensitive names)
+- Worker loop with polling, retries, and graceful stop
+- Exponential backoff retries with optional jitter and cap
+- Job lifecycle tracking: `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`
 
 ## Requirements
 
-- Python 3.10+ (uses dataclass `slots=True` and modern typing)
+- Python 3.12+
+
+## Installation
+
+- From source (local dev): `pip install -e .`
+- CLI entry point installs as `pinion`
 
 ## Quick Start
 
-Run the demo script:
+### CLI demo
+
+Run the bundled demo (registers a simple `add` task and processes one job):
 
 ```bash
-python skepticqueue/v1.py
+pinion
 ```
 
-It will:
-- Start a worker thread
-- Enqueue a success task (`add(1, 2)`) and a failing task (`boom`)
-- Show retries for the failing task and then stop
-
-## Core Concepts
-
-- Job: encapsulates a function name, args/kwargs, id, status, attempts, timestamps
-- Storage: SPI with `enqueue`, `dequeue`, `mark_done`, `mark_failed`, `size`
-- Task registry: map of function name → callable, registered via `@task`
-- Worker: pulls jobs, executes task callables, applies retry policy
-- Retry policy: `max_retries` and `base_delay` (exponential backoff)
-
-## Usage
-
-Register tasks (case‑insensitive lookup):
+### Library usage (in-memory)
 
 ```python
-from skepticqueue.v1 import task
+import threading, time
+from pinion import task, Job, InMemoryStorage, Worker, RetryPolicy
 
-@task()  # name defaults to function name
+@task()
 def add(a: int, b: int) -> int:
     return a + b
 
-@task("boom")  # explicit name
-def fail() -> None:
-    raise ValueError("kaboom")
-```
-
-Enqueue and run a worker:
-
-```python
-from skepticqueue.v1 import InMemoryStorage, Worker, Job
-import threading, time
-
 storage = InMemoryStorage()
-worker = Worker(storage)
+worker = Worker(storage, retry=RetryPolicy(jitter=False))
 thread = threading.Thread(target=worker.run_forever, daemon=True)
 thread.start()
 
 storage.enqueue(Job("add", (1, 2)))   # args tuple
-storage.enqueue(Job("BOOM"))           # proves case-insensitive lookup
+storage.enqueue(Job("BOOM"))           # case-insensitive lookup (if registered)
 
 time.sleep(2.5)
 worker.stop()
 thread.join()
 ```
 
+### Library usage (SQLite)
+
+```python
+import threading, time
+from pinion import task, Job, Worker, RetryPolicy
+from pinion.queue import SqliteStorage  # durable backend
+
+@task("boom")
+def fail() -> None:
+    raise ValueError("kaboom")
+
+storage = SqliteStorage("pinion.db")
+worker = Worker(storage, retry=RetryPolicy(jitter=False))
+t = threading.Thread(target=worker.run_forever, daemon=True)
+t.start()
+
+storage.enqueue(Job("fail"))
+
+time.sleep(4.5)
+worker.stop()
+t.join()
+```
+
+## Core Concepts
+
+- Job: encapsulates function name, args/kwargs, id, status, attempts, timestamps
+- Storage: SPI with `enqueue`, `dequeue`, `mark_done`, `mark_failed`, `size`
+- Task registry: mapping of case-insensitive names to callables via `@task`
+- Worker: pulls jobs, executes callables, applies retry policy
+- Retry policy: `max_retries`, `base_delay`, `cap`, optional `jitter`
+
 ## Extending Storage
 
-Implement the `Storage` protocol to plug in your own backend (e.g., Redis, database, file‑based):
+Implement the `Storage` protocol to plug in your own backend (e.g., Redis, DB, file-based):
 
 ```python
 class MyStorage:
@@ -89,21 +103,24 @@ class MyStorage:
 ## Design Notes
 
 - `InMemoryStorage` uses a `Condition` for coordinating producers/consumers.
-- `Worker` uses `JobExecution` context manager to handle marking success/failure.
-- Retries are scheduled by re‑enqueuing the same job after a computed delay.
-- Registry keys are normalized to lowercase for case‑insensitive task names.
+- `SqliteStorage` uses WAL mode and an atomic claim (`BEGIN IMMEDIATE` + `UPDATE`) to safely select a `PENDING` job across processes.
+- `Worker` uses a `JobExecution` context manager to mark success/failure.
+- Retries are scheduled by re-enqueuing the same job after a computed delay.
+- Registry keys are normalized to lowercase for case-insensitive task names.
 
 ## Limitations
 
-- In‑memory only: jobs are not persisted across process restarts.
-- No result storage/return channel; tasks print or handle their own outputs.
-- Basic visibility: failures recorded internally; no metrics/inspection API.
-- Single-process focus; you can run multiple workers against one storage, but distribution/locking depends on the storage backend.
+- In-memory storage is ephemeral; jobs are not persisted across restarts.
+- SQLite backend is local to a machine; horizontal scaling requires a different backend.
+- No result storage/return channel; tasks handle their own outputs.
+- Minimal inspection/metrics API.
 
 ## Project Layout
 
-- `skepticqueue/v1.py` — the Pinion implementation and demo
+- `pinion/queue.py` — core queue, worker, storages, demo tasks
+- `pinion/cli.py` — simple CLI demo (`pinion`)
 
 ---
 
-Pinion aims to be a tiny, understandable foundation that you can extend with a real storage backend and operational features as needed.
+Pinion aims to be a tiny, understandable foundation you can extend with a real storage backend and operational features as needed.
+
