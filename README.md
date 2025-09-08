@@ -8,8 +8,10 @@ Pinion is a tiny, pluggable job queue and worker for Python. It provides a simpl
 - Durable SQLite storage with atomic job claim (WAL) across processes
 - Pluggable `Storage` protocol (SPI) for custom backends
 - Task registry via `@task` decorator (case-insensitive names)
-- Worker loop with polling, retries, and graceful stop
+- Worker loop with polling, retries, timeouts, and graceful stop/join
 - Exponential backoff retries with optional jitter and cap
+- Dead-letter queue (DLQ) after exhausted retries
+- Basic worker metrics (processed/succeeded/failed/retried/dead_lettered/reaped)
 - Job lifecycle tracking: `PENDING`, `RUNNING`, `SUCCESS`, `FAILED`
 
 ## Requirements
@@ -42,7 +44,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 storage = InMemoryStorage()
-worker = Worker(storage, retry=RetryPolicy(jitter=False))
+worker = Worker(storage, retry=RetryPolicy(jitter=False), task_timeout=2.0)
 thread = threading.Thread(target=worker.run_forever, daemon=True)
 thread.start()
 
@@ -52,6 +54,8 @@ storage.enqueue(Job("BOOM"))           # case-insensitive lookup (if registered)
 time.sleep(2.5)
 worker.stop()
 thread.join()
+# Optional: access basic metrics
+print(worker.metrics)
 ```
 
 ### Library usage (SQLite)
@@ -66,7 +70,7 @@ def fail() -> None:
     raise ValueError("kaboom")
 
 storage = SqliteStorage("pinion.db")
-worker = Worker(storage, retry=RetryPolicy(jitter=False))
+worker = Worker(storage, retry=RetryPolicy(jitter=False), task_timeout=2.0)
 t = threading.Thread(target=worker.run_forever, daemon=True)
 t.start()
 
@@ -75,15 +79,21 @@ storage.enqueue(Job("fail"))
 time.sleep(4.5)
 worker.stop()
 t.join()
+
+# Inspect DLQ (SQLite backend) for permanently failed jobs
+# rows: (id, func_name, args_json, kwargs_json, attempts, error, failed_at)
+print(storage._conn.execute("SELECT * FROM dlq").fetchall())
 ```
 
 ## Core Concepts
 
 - Job: encapsulates function name, args/kwargs, id, status, attempts, timestamps
-- Storage: SPI with `enqueue`, `dequeue`, `mark_done`, `mark_failed`, `size`
+- Storage: SPI with `enqueue`, `dequeue`, `mark_done`, `mark_failed`, `size`, `heartbeat`, `reap_stale`, `dead_letter`
 - Task registry: mapping of case-insensitive names to callables via `@task`
-- Worker: pulls jobs, executes callables, applies retry policy
+- Worker: pulls jobs, executes callables, applies retry policy and optional per-task timeouts
 - Retry policy: `max_retries`, `base_delay`, `cap`, optional `jitter`
+- DLQ: jobs moved to durable dead-letter storage after retries are exhausted
+- Metrics: basic counters available via `worker.metrics`
 
 ## Extending Storage
 
@@ -96,6 +106,9 @@ class MyStorage:
     def mark_done(self, job: Job) -> None: ...
     def mark_failed(self, job: Job, exc: Exception) -> None: ...
     def size(self) -> int: ...
+    def heartbeat(self, job: Job) -> None: ...
+    def reap_stale(self, visibility_timeout: float) -> int: ...
+    def dead_letter(self, job: Job, exc: Exception) -> None: ...
 ```
 
 `dequeue` should block until timeout or a job is available, mark the job `RUNNING`, and increment `attempts` before returning the job.
@@ -103,17 +116,61 @@ class MyStorage:
 ## Design Notes
 
 - `InMemoryStorage` uses a `Condition` for coordinating producers/consumers.
-- `SqliteStorage` uses WAL mode and an atomic claim (`BEGIN IMMEDIATE` + `UPDATE`) to safely select a `PENDING` job across processes.
-- `Worker` uses a `JobExecution` context manager to mark success/failure.
+- `SqliteStorage` uses WAL mode and an atomic claim (`BEGIN IMMEDIATE` + `UPDATE`) to safely select a `PENDING` job across processes. Access is serialized with a lock.
+- `Worker` uses a `JobExecution` context manager to mark success/failure and provides a thread-based per-task timeout option.
 - Retries are scheduled by re-enqueuing the same job after a computed delay.
 - Registry keys are normalized to lowercase for case-insensitive task names.
+- DLQ persists final failures (SQLite backend has a `dlq` table).
 
 ## Limitations
 
 - In-memory storage is ephemeral; jobs are not persisted across restarts.
 - SQLite backend is local to a machine; horizontal scaling requires a different backend.
+- Thread-based timeouts cannot kill Python threads; long-running tasks should be cooperative or run in separate processes.
 - No result storage/return channel; tasks handle their own outputs.
 - Minimal inspection/metrics API.
+
+## Breaking Changes (since 0.1.x)
+
+- Storage SPI: added `dead_letter(job, exc)`; custom backends must implement it.
+
+## Release and Publishing
+
+Pinion targets Python 3.12+ and is published as `pinion-queue`.
+
+Suggested versioning for this release: bump to `0.2.0`.
+
+1) Update version
+
+- Edit `pyproject.toml`: set `version = "0.2.0"`.
+- Edit `pinion/__init__.py`: set `__version__ = "0.2.0"`.
+
+2) Build distributions
+
+```bash
+python -m pip install --upgrade pip build twine
+python -m build
+twine check dist/*
+```
+
+3) Publish to PyPI
+
+```bash
+# Set PYPI token in environment (from your PyPI account)
+export TWINE_USERNAME="__token__"
+export TWINE_PASSWORD="pypi-***your-token***"
+
+twine upload dist/*
+```
+
+4) Tag the release
+
+```bash
+git tag v0.2.0
+git push --tags
+```
+
+If `pinion-queue` is not available on PyPI, choose an alternative name or organization namespace.
 
 ## Project Layout
 
@@ -123,4 +180,3 @@ class MyStorage:
 ---
 
 Pinion aims to be a tiny, understandable foundation you can extend with a real storage backend and operational features as needed.
-

@@ -38,6 +38,8 @@ class Storage(Protocol):
     # Heartbeat and reaping
     def heartbeat(self, job: Job) -> None: ...
     def reap_stale(self, visibility_timeout: float) -> int: ...
+    # Dead letter queue
+    def dead_letter(self, job: Job, exc: Exception) -> None: ...
 
 
 # ---------- In-memory storage ----------
@@ -49,6 +51,7 @@ class InMemoryStorage:
         self._done: set[str] = set()
         self._heartbeats: dict[str, float] = {}
         self._running: dict[str, Job] = {}
+        self._dlq: list[tuple[Job, str, float]] = []
 
     def enqueue(self, job: Job) -> None:
         with self._cv:
@@ -115,6 +118,11 @@ class InMemoryStorage:
             if reaped:
                 self._cv.notify_all()
         return reaped
+
+    def dead_letter(self, job: Job, exc: Exception) -> None:
+        with self._cv:
+            self._dlq.append((job, repr(exc), time.time()))
+            self._cv.notify_all()
 
 
 # ---------- Task registry (case-insensitive) ----------
@@ -184,6 +192,7 @@ class Worker:
         visibility_timeout: float | None = 10.0,
         heartbeat_interval: float = 1.0,
         reap_interval: float = 2.0,
+        task_timeout: float | None = None,
     ):
         self.storage = storage
         self.poll_timeout = poll_timeout
@@ -196,6 +205,15 @@ class Worker:
         self._current_job: Job | None = None
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True)
+        self.task_timeout = task_timeout
+        self.metrics = {
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "retried": 0,
+            "dead_lettered": 0,
+            "reaped": 0,
+        }
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -220,8 +238,42 @@ class Worker:
             )
             try:
                 self._current_job = job
-                with JobExecution(self.storage, job) as fn:
-                    fn(*job.args, **job.kwargs)
+                # Resolve the task early so TaskNotFound gets marked as failed
+                fn = REGISTRY.get(job.func_name.lower())
+                if not fn:
+                    raise TaskNotFound(
+                        f"no task registered: {job.func_name!r} (known: {list(REGISTRY)})"
+                    )
+                # Execute with optional timeout
+                if self.task_timeout is None or self.task_timeout <= 0:
+                    with JobExecution(self.storage, job) as _:
+                        fn(*job.args, **job.kwargs)
+                else:
+                    # Run in a helper thread and wait up to task_timeout
+                    result: dict[str, Any] = {}
+
+                    def _call():
+                        try:
+                            fn(*job.args, **job.kwargs)
+                            result["ok"] = True
+                        except Exception as ex:  # propagate later
+                            result["exc"] = ex
+
+                    t = threading.Thread(target=_call)
+                    t.daemon = True
+                    t.start()
+                    t.join(self.task_timeout)
+                    if t.is_alive():
+                        # Timed out; mark failed and proceed (cannot kill the thread)
+                        raise TimeoutError(f"task timed out after {self.task_timeout}s")
+                    # If thread finished, check for exception
+                    if "exc" in result:
+                        raise result["exc"]
+                    with JobExecution(self.storage, job):
+                        # Success already happened, just finalize
+                        pass
+                self.metrics["processed"] += 1
+                self.metrics["succeeded"] += 1
             except Exception as e:
                 self.log.exception(
                     "job.fail id=%s name=%s attempt=%d err=%r",
@@ -230,6 +282,13 @@ class Worker:
                     job.attempts,
                     e,
                 )
+                # If failure happened before entering context (e.g., missing task),
+                # it hasn't been marked yet — record failure now.
+                if job.status is not Status.FAILED and job.status is not Status.SUCCESS:
+                    try:
+                        self.storage.mark_failed(job, e)
+                    except Exception:
+                        pass
                 # attempts incremented in dequeue(); attempt 1 just ran
                 if job.attempts <= self.retry.max_retries:
                     delay = self.retry.compute_delay(job.attempts)
@@ -240,6 +299,8 @@ class Worker:
                         job.attempts + 1,
                     )
                     _requeue_later(self.storage, job, delay)
+                    self.metrics["failed"] += 1
+                    self.metrics["retried"] += 1
                 else:
                     self.log.error(
                         "job.giveup id=%s name=%s attempt=%d",
@@ -247,6 +308,11 @@ class Worker:
                         job.func_name,
                         job.attempts,
                     )
+                    try:
+                        self.storage.dead_letter(job, e)
+                        self.metrics["dead_lettered"] += 1
+                    except Exception:
+                        pass
             finally:
                 self._current_job = None
 
@@ -269,10 +335,17 @@ class Worker:
                 count = self.storage.reap_stale(self.visibility_timeout)
                 if count:
                     self.log.info("reaper.requeued count=%d", count)
+                    self.metrics["reaped"] += int(count)
             except Exception:
                 # best-effort reaping
                 pass
             self.stop_event.wait(self.reap_interval)
+
+    def join(self, timeout: float | None = None) -> None:
+        # Give helper threads a chance to exit
+        self._hb_thread.join(timeout=timeout)
+        if self.visibility_timeout is not None:
+            self._reaper_thread.join(timeout=timeout)
 
 
 class PinionError(Exception):
@@ -290,37 +363,53 @@ class TaskExecutionError(PinionError):
 class SqliteStorage:
     def __init__(self, path: str = "pinion.db") -> None:
         self._cv = threading.Condition()  # local process wakeups
+        self._lock = threading.RLock()    # serialize access to sqlite connection
         self._conn = sqlite3.connect(
             path, isolation_level=None, check_same_thread=False
         )
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA busy_timeout=3000;")
-        self._conn.execute(
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA busy_timeout=3000;")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id         TEXT PRIMARY KEY,
+                    func_name  TEXT NOT NULL,
+                    args       TEXT NOT NULL,   -- json
+                    kwargs     TEXT NOT NULL,   -- json
+                    status     TEXT NOT NULL,   -- PENDING/RUNNING/SUCCESS/FAILED
+                    attempts   INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    error      TEXT,
+                    heartbeat_at REAL
+                );
             """
-            CREATE TABLE IF NOT EXISTS jobs (
-                id         TEXT PRIMARY KEY,
-                func_name  TEXT NOT NULL,
-                args       TEXT NOT NULL,   -- json
-                kwargs     TEXT NOT NULL,   -- json
-                status     TEXT NOT NULL,   -- PENDING/RUNNING/SUCCESS/FAILED
-                attempts   INTEGER NOT NULL,
-                created_at REAL NOT NULL,
-                error      TEXT,
-                heartbeat_at REAL
-            );
-        """
-        )
-        # Best-effort schema upgrade for older DBs without heartbeat_at
-        try:
-            self._conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at REAL;")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_status_hb ON jobs(status, heartbeat_at);"
-        )
+            )
+            # Best-effort schema upgrade for older DBs without heartbeat_at
+            try:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at REAL;")
+            except sqlite3.OperationalError:
+                pass
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status_hb ON jobs(status, heartbeat_at);"
+            )
+            # Dead letter table
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dlq (
+                    id           TEXT PRIMARY KEY,
+                    func_name    TEXT NOT NULL,
+                    args         TEXT NOT NULL,
+                    kwargs       TEXT NOT NULL,
+                    attempts     INTEGER NOT NULL,
+                    error        TEXT NOT NULL,
+                    failed_at    REAL NOT NULL
+                );
+                """
+            )
 
     # --- helpers ---
     @staticmethod
@@ -338,52 +427,54 @@ class SqliteStorage:
 
     # --- API ---
     def enqueue(self, job: Job) -> None:
-        with self._cv:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO jobs (id, func_name, args, kwargs, status, attempts, created_at, error, heartbeat_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                (
-                    job.id,
-                    job.func_name,
-                    json.dumps(list(job.args)),
-                    json.dumps(job.kwargs),
-                    job.status.name,
-                    job.attempts,
-                    job.created_at,
-                ),
-            )
-            self._cv.notify_all()
+        with self._lock:
+            with self._cv:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO jobs (id, func_name, args, kwargs, status, attempts, created_at, error, heartbeat_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                    (
+                        job.id,
+                        job.func_name,
+                        json.dumps(list(job.args)),
+                        json.dumps(job.kwargs),
+                        job.status.name,
+                        job.attempts,
+                        job.created_at,
+                    ),
+                )
+                self._cv.notify_all()
 
     def dequeue(self, timeout: float | None = None) -> Job | None:
         deadline = None if timeout is None else time.time() + timeout
         while True:
             # try to claim a pending job atomically
             try:
-                cur = self._conn.cursor()
-                cur.execute("BEGIN IMMEDIATE;")  # take write lock for atomic claim
-                row = cur.execute(
-                    "SELECT id FROM jobs WHERE status='PENDING' ORDER BY created_at LIMIT 1;"
-                ).fetchone()
-                if row is None:
-                    self._conn.execute("COMMIT;")
-                else:
-                    job_id = row[0]
-                    updated = cur.execute(
-                        "UPDATE jobs SET status='RUNNING', attempts=attempts+1, heartbeat_at=? "
-                        "WHERE id=? AND status='PENDING';",
-                        (time.time(), job_id),
-                    ).rowcount
-                    if updated == 1:
-                        job_row = cur.execute(
-                            "SELECT id, func_name, args, kwargs, status, attempts, created_at, error "
-                            "FROM jobs WHERE id=?;",
-                            (job_id,),
-                        ).fetchone()
+                with self._lock:
+                    cur = self._conn.cursor()
+                    cur.execute("BEGIN IMMEDIATE;")  # take write lock for atomic claim
+                    row = cur.execute(
+                        "SELECT id FROM jobs WHERE status='PENDING' ORDER BY created_at LIMIT 1;"
+                    ).fetchone()
+                    if row is None:
                         self._conn.execute("COMMIT;")
-                        return self._row_to_job(job_row)
                     else:
-                        self._conn.execute("ROLLBACK;")
-                        continue
+                        job_id = row[0]
+                        updated = cur.execute(
+                            "UPDATE jobs SET status='RUNNING', attempts=attempts+1, heartbeat_at=? "
+                            "WHERE id=? AND status='PENDING';",
+                            (time.time(), job_id),
+                        ).rowcount
+                        if updated == 1:
+                            job_row = cur.execute(
+                                "SELECT id, func_name, args, kwargs, status, attempts, created_at, error "
+                                "FROM jobs WHERE id=?;",
+                                (job_id,),
+                            ).fetchone()
+                            self._conn.execute("COMMIT;")
+                            return self._row_to_job(job_row)
+                        else:
+                            self._conn.execute("ROLLBACK;")
+                            continue
             except sqlite3.OperationalError:
                 # busy; brief backoff
                 time.sleep(0.01)
@@ -400,47 +491,67 @@ class SqliteStorage:
                     self._cv.wait(min(0.25, remaining))
 
     def mark_done(self, job: Job) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET status='SUCCESS', error=NULL WHERE id=?;",
-            (job.id,),
-        )
-        with self._cv:
-            self._cv.notify_all()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET status='SUCCESS', error=NULL WHERE id=?;",
+                (job.id,),
+            )
+            with self._cv:
+                self._cv.notify_all()
 
     def mark_failed(self, job: Job, exc: Exception) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET status='FAILED', error=? WHERE id=?;",
-            (repr(exc), job.id),
-        )
-        with self._cv:
-            self._cv.notify_all()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET status='FAILED', error=? WHERE id=?;",
+                (repr(exc), job.id),
+            )
+            with self._cv:
+                self._cv.notify_all()
 
     def size(self) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status='PENDING';"
-        ).fetchone()
-        return int(row[0])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status='PENDING';"
+            ).fetchone()
+            return int(row[0])
 
     def heartbeat(self, job: Job) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET heartbeat_at=? WHERE id=? AND status='RUNNING';",
-            (time.time(), job.id),
-        )
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET heartbeat_at=? WHERE id=? AND status='RUNNING';",
+                (time.time(), job.id),
+            )
 
     def reap_stale(self, visibility_timeout: float) -> int:
         cutoff = time.time() - visibility_timeout
-        with self._cv:
-            cur = self._conn.cursor()
-            cur.execute("BEGIN IMMEDIATE;")
-            cur.execute(
-                "UPDATE jobs SET status='PENDING' WHERE status='RUNNING' AND (heartbeat_at IS NULL OR heartbeat_at < ?);",
-                (cutoff,),
+        with self._lock:
+            with self._cv:
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE;")
+                cur.execute(
+                    "UPDATE jobs SET status='PENDING' WHERE status='RUNNING' AND (heartbeat_at IS NULL OR heartbeat_at < ?);",
+                    (cutoff,),
+                )
+                count = cur.rowcount
+                self._conn.execute("COMMIT;")
+                if count:
+                    self._cv.notify_all()
+                return int(count)
+
+    def dead_letter(self, job: Job, exc: Exception) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO dlq (id, func_name, args, kwargs, attempts, error, failed_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                (
+                    job.id,
+                    job.func_name,
+                    json.dumps(list(job.args)),
+                    json.dumps(job.kwargs),
+                    job.attempts,
+                    repr(exc),
+                    time.time(),
+                ),
             )
-            count = cur.rowcount
-            self._conn.execute("COMMIT;")
-            if count:
-                self._cv.notify_all()
-            return int(count)
 
 
 
