@@ -5,6 +5,7 @@ from typing import Any, Protocol, runtime_checkable, Callable
 from collections import deque
 import threading, time, uuid
 import logging, random
+import sqlite3, json
 
 
 # ---------- Domain ----------
@@ -188,7 +189,7 @@ class Worker:
                     _requeue_later(self.storage, job, delay)
                 else:
                     self.log.error(
-                        "job.success id=%s name=%s attempt=%d",
+                        "job.giveup id=%s name=%s attempt=%d",
                         job.id,
                         job.func_name,
                         job.attempts,
@@ -205,6 +206,132 @@ class TaskNotFound(PinionError):
 
 class TaskExecutionError(PinionError):
     pass
+
+
+class SqliteStorage:
+    def __init__(self, path: str = "pinion.db") -> None:
+        self._cv = threading.Condition()  # local process wakeups
+        self._conn = sqlite3.connect(
+            path, isolation_level=None, check_same_thread=False
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA busy_timeout=3000;")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id         TEXT PRIMARY KEY,
+                func_name  TEXT NOT NULL,
+                args       TEXT NOT NULL,   -- json
+                kwargs     TEXT NOT NULL,   -- json
+                status     TEXT NOT NULL,   -- PENDING/RUNNING/SUCCESS/FAILED
+                attempts   INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                error      TEXT
+            );
+        """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);"
+        )
+
+    # --- helpers ---
+    @staticmethod
+    def _row_to_job(row: tuple[Any, ...]) -> Job:
+        id, func_name, args, kwargs, status, attempts, created_at, _ = row
+        return Job(
+            func_name=func_name,
+            args=tuple(json.loads(args)),
+            kwargs=json.loads(kwargs),
+            id=id,
+            status=Status[status],
+            attempts=attempts,
+            created_at=created_at,
+        )
+
+    # --- API ---
+    def enqueue(self, job: Job) -> None:
+        with self._cv:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO jobs (id, func_name, args, kwargs, status, attempts, created_at, error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    job.id,
+                    job.func_name,
+                    json.dumps(list(job.args)),
+                    json.dumps(job.kwargs),
+                    job.status.name,
+                    job.attempts,
+                    job.created_at,
+                ),
+            )
+            self._cv.notify_all()
+
+    def dequeue(self, timeout: float | None = None) -> Job | None:
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            # try to claim a pending job atomically
+            try:
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE;")  # take write lock for atomic claim
+                row = cur.execute(
+                    "SELECT id FROM jobs WHERE status='PENDING' ORDER BY created_at LIMIT 1;"
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("COMMIT;")
+                else:
+                    job_id = row[0]
+                    updated = cur.execute(
+                        "UPDATE jobs SET status='RUNNING', attempts=attempts+1 "
+                        "WHERE id=? AND status='PENDING';",
+                        (job_id,),
+                    ).rowcount
+                    if updated == 1:
+                        job_row = cur.execute(
+                            "SELECT id, func_name, args, kwargs, status, attempts, created_at, error "
+                            "FROM jobs WHERE id=?;",
+                            (job_id,),
+                        ).fetchone()
+                        self._conn.execute("COMMIT;")
+                        return self._row_to_job(job_row)
+                    else:
+                        self._conn.execute("ROLLBACK;")
+                        continue
+            except sqlite3.OperationalError:
+                # busy; brief backoff
+                time.sleep(0.01)
+
+            # none available: optionally block
+            if timeout is None:
+                with self._cv:
+                    self._cv.wait(0.25)
+            else:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                with self._cv:
+                    self._cv.wait(min(0.25, remaining))
+
+    def mark_done(self, job: Job) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET status='SUCCESS', error=NULL WHERE id=?;",
+            (job.id,),
+        )
+        with self._cv:
+            self._cv.notify_all()
+
+    def mark_failed(self, job: Job, exc: Exception) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET status='FAILED', error=? WHERE id=?;",
+            (repr(exc), job.id),
+        )
+        with self._cv:
+            self._cv.notify_all()
+
+    def size(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='PENDING';"
+        ).fetchone()
+        return int(row[0])
 
 
 # ---------- Demo tasks ----------
@@ -224,8 +351,8 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
-    s = InMemoryStorage()
-    w = Worker(s)
+    s = SqliteStorage("pinion.db")
+    w = Worker(s, retry=RetryPolicy(jitter=False))
     t = threading.Thread(target=w.run_forever, daemon=True)
     t.start()
 
