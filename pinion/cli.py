@@ -1,6 +1,18 @@
 def main() -> None:
+    import argparse
     import logging, threading, time
+    from . import __version__
     from .queue import InMemoryStorage, Worker, RetryPolicy, Job, task
+
+    parser = argparse.ArgumentParser(prog="pinion", add_help=True)
+    parser.add_argument(
+        "-V", "--version", action="store_true", help="print version and exit"
+    )
+    args = parser.parse_args()
+
+    if args.version:
+        print(__version__)
+        return
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
