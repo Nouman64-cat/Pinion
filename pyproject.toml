@@ -25,3 +25,14 @@ Issues = "https://github.com/Nouman64-cat/Pinion/issues"
 
 [project.scripts]
 pinion = "pinion.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pinion"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "pinion",
+  "README.md",
+  "pyproject.toml",
+  "LICENSE",
+]

@@ -35,6 +35,9 @@ class Storage(Protocol):
     def mark_done(self, job: Job) -> None: ...
     def mark_failed(self, job: Job, exc: Exception) -> None: ...
     def size(self) -> int: ...
+    # Heartbeat and reaping
+    def heartbeat(self, job: Job) -> None: ...
+    def reap_stale(self, visibility_timeout: float) -> int: ...
 
 
 # ---------- In-memory storage ----------
@@ -44,6 +47,8 @@ class InMemoryStorage:
         self._cv = threading.Condition()
         self._failures: dict[str, str] = {}
         self._done: set[str] = set()
+        self._heartbeats: dict[str, float] = {}
+        self._running: dict[str, Job] = {}
 
     def enqueue(self, job: Job) -> None:
         with self._cv:
@@ -64,21 +69,52 @@ class InMemoryStorage:
             job = self._q.popleft()
             job.status = Status.RUNNING
             job.attempts += 1
+            self._heartbeats[job.id] = time.time()
+            self._running[job.id] = job
             return job
 
     def mark_done(self, job: Job) -> None:
         job.status = Status.SUCCESS
         with self._cv:
             self._done.add(job.id)
+            self._heartbeats.pop(job.id, None)
+            self._running.pop(job.id, None)
 
     def mark_failed(self, job: Job, exc: Exception) -> None:
         job.status = Status.FAILED
         with self._cv:
             self._failures[job.id] = repr(exc)
+            self._heartbeats.pop(job.id, None)
+            self._running.pop(job.id, None)
 
     def size(self) -> int:
         with self._cv:
             return len(self._q)
+
+    def heartbeat(self, job: Job) -> None:
+        with self._cv:
+            if job.status is Status.RUNNING:
+                self._heartbeats[job.id] = time.time()
+
+    def reap_stale(self, visibility_timeout: float) -> int:
+        now = time.time()
+        reaped = 0
+        with self._cv:
+            stale_ids = [
+                jid
+                for jid, hb in list(self._heartbeats.items())
+                if hb + visibility_timeout < now
+            ]
+            for jid in stale_ids:
+                self._heartbeats.pop(jid, None)
+                job = self._running.pop(jid, None)
+                if job is not None and job.status is Status.RUNNING:
+                    job.status = Status.PENDING
+                    self._q.append(job)
+                    reaped += 1
+            if reaped:
+                self._cv.notify_all()
+        return reaped
 
 
 # ---------- Task registry (case-insensitive) ----------
@@ -145,17 +181,33 @@ class Worker:
         poll_timeout: float = 0.5,
         retry: RetryPolicy | None = None,
         logger: logging.Logger | None = None,
+        visibility_timeout: float | None = 10.0,
+        heartbeat_interval: float = 1.0,
+        reap_interval: float = 2.0,
     ):
         self.storage = storage
         self.poll_timeout = poll_timeout
         self.retry = retry or RetryPolicy()
         self.stop_event = threading.Event()
         self.log = logger or logging.getLogger("pinion.worker")
+        self.visibility_timeout = visibility_timeout
+        self.heartbeat_interval = heartbeat_interval
+        self.reap_interval = reap_interval
+        self._current_job: Job | None = None
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True)
 
     def stop(self) -> None:
         self.stop_event.set()
+        # Give background threads a chance to exit
+        # They are daemons, so joining is optional; keep it light
 
     def run_forever(self) -> None:
+        # start background helpers on first run
+        if not self._hb_thread.is_alive():
+            self._hb_thread.start()
+        if self.visibility_timeout is not None and not self._reaper_thread.is_alive():
+            self._reaper_thread.start()
         while not self.stop_event.is_set():
             job = self.storage.dequeue(timeout=self.poll_timeout)
             if job is None:
@@ -167,6 +219,7 @@ class Worker:
                 job.attempts,
             )
             try:
+                self._current_job = job
                 with JobExecution(self.storage, job) as fn:
                     fn(*job.args, **job.kwargs)
             except Exception as e:
@@ -194,6 +247,32 @@ class Worker:
                         job.func_name,
                         job.attempts,
                     )
+            finally:
+                self._current_job = None
+
+    def _heartbeat_loop(self) -> None:
+        while not self.stop_event.is_set():
+            job = self._current_job
+            if job is not None:
+                try:
+                    self.storage.heartbeat(job)
+                except Exception:
+                    # best-effort heartbeat
+                    pass
+            self.stop_event.wait(self.heartbeat_interval)
+
+    def _reaper_loop(self) -> None:
+        if self.visibility_timeout is None:
+            return
+        while not self.stop_event.is_set():
+            try:
+                count = self.storage.reap_stale(self.visibility_timeout)
+                if count:
+                    self.log.info("reaper.requeued count=%d", count)
+            except Exception:
+                # best-effort reaping
+                pass
+            self.stop_event.wait(self.reap_interval)
 
 
 class PinionError(Exception):
@@ -226,12 +305,21 @@ class SqliteStorage:
                 status     TEXT NOT NULL,   -- PENDING/RUNNING/SUCCESS/FAILED
                 attempts   INTEGER NOT NULL,
                 created_at REAL NOT NULL,
-                error      TEXT
+                error      TEXT,
+                heartbeat_at REAL
             );
         """
         )
+        # Best-effort schema upgrade for older DBs without heartbeat_at
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at REAL;")
+        except sqlite3.OperationalError:
+            pass
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_hb ON jobs(status, heartbeat_at);"
         )
 
     # --- helpers ---
@@ -252,8 +340,8 @@ class SqliteStorage:
     def enqueue(self, job: Job) -> None:
         with self._cv:
             self._conn.execute(
-                "INSERT OR REPLACE INTO jobs (id, func_name, args, kwargs, status, attempts, created_at, error)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                "INSERT OR REPLACE INTO jobs (id, func_name, args, kwargs, status, attempts, created_at, error, heartbeat_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
                 (
                     job.id,
                     job.func_name,
@@ -281,9 +369,9 @@ class SqliteStorage:
                 else:
                     job_id = row[0]
                     updated = cur.execute(
-                        "UPDATE jobs SET status='RUNNING', attempts=attempts+1 "
+                        "UPDATE jobs SET status='RUNNING', attempts=attempts+1, heartbeat_at=? "
                         "WHERE id=? AND status='PENDING';",
-                        (job_id,),
+                        (time.time(), job_id),
                     ).rowcount
                     if updated == 1:
                         job_row = cur.execute(
@@ -332,6 +420,28 @@ class SqliteStorage:
             "SELECT COUNT(*) FROM jobs WHERE status='PENDING';"
         ).fetchone()
         return int(row[0])
+
+    def heartbeat(self, job: Job) -> None:
+        self._conn.execute(
+            "UPDATE jobs SET heartbeat_at=? WHERE id=? AND status='RUNNING';",
+            (time.time(), job.id),
+        )
+
+    def reap_stale(self, visibility_timeout: float) -> int:
+        cutoff = time.time() - visibility_timeout
+        with self._cv:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            cur.execute(
+                "UPDATE jobs SET status='PENDING' WHERE status='RUNNING' AND (heartbeat_at IS NULL OR heartbeat_at < ?);",
+                (cutoff,),
+            )
+            count = cur.rowcount
+            self._conn.execute("COMMIT;")
+            if count:
+                self._cv.notify_all()
+            return int(count)
+
 
 
 # ---------- Demo tasks ----------
