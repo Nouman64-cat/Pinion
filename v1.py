@@ -4,6 +4,7 @@ from enum import Enum, auto
 from typing import Any, Protocol, runtime_checkable, Callable
 from collections import deque
 import threading, time, uuid
+import logging, random
 
 
 # ---------- Domain ----------
@@ -97,14 +98,6 @@ class JobExecution:
         self.storage = storage
         self.job = job
 
-    def __enter__(self) -> Callable[..., Any]:
-        fn = REGISTRY.get(self.job.func_name.lower())
-        if not fn:
-            raise KeyError(
-                f"no task registered: {self.job.func_name!r} (known: {list(REGISTRY)})"
-            )
-        return fn
-
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc_type is None:
             self.storage.mark_done(self.job)
@@ -112,12 +105,26 @@ class JobExecution:
             self.storage.mark_failed(self.job, exc)
         return False  # don't suppress exceptions
 
+    def __enter__(self) -> Callable[..., Any]:
+        fn = REGISTRY.get(self.job.func_name.lower())
+        if not fn:
+            raise TaskNotFound(
+                f"no task registered: {self.job.func_name!r} (known: {list(REGISTRY)})"
+            )
+        return fn
+
 
 # ---------- Retry policy ----------
 @dataclass(slots=True)
 class RetryPolicy:
     max_retries: int = 3
     base_delay: float = 0.5  # seconds
+    cap: float = 10.0
+    jitter: bool = True
+
+    def compute_delay(self, attempt: int) -> float:
+        raw = min(self.cap, self.base_delay * (2 ** (attempt - 1)))
+        return random.uniform(0, raw) if self.jitter else raw
 
 
 def _requeue_later(storage: Storage, job: Job, delay: float) -> None:
@@ -136,11 +143,13 @@ class Worker:
         storage: Storage,
         poll_timeout: float = 0.5,
         retry: RetryPolicy | None = None,
+        logger: logging.Logger | None = None,
     ):
         self.storage = storage
         self.poll_timeout = poll_timeout
         self.retry = retry or RetryPolicy()
         self.stop_event = threading.Event()
+        self.log = logger or logging.getLogger("pinion.worker")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -150,18 +159,52 @@ class Worker:
             job = self.storage.dequeue(timeout=self.poll_timeout)
             if job is None:
                 continue
+            self.log.info(
+                "job.start id=%s name=%s attempt=%d",
+                job.id,
+                job.func_name,
+                job.attempts,
+            )
             try:
                 with JobExecution(self.storage, job) as fn:
                     fn(*job.args, **job.kwargs)
             except Exception as e:
-                print(f"[worker] job {job.id} failed: {e!r}")
+                self.log.exception(
+                    "job.fail id=%s name=%s attempt=%d err=%r",
+                    job.id,
+                    job.func_name,
+                    job.attempts,
+                    e,
+                )
                 # attempts incremented in dequeue(); attempt 1 just ran
                 if job.attempts <= self.retry.max_retries:
-                    delay = self.retry.base_delay * (2 ** (job.attempts - 1))
-                    print(
-                        f"[worker] retrying {job.id} in {delay}s (attempt {job.attempts}/{self.retry.max_retries})"
+                    delay = self.retry.compute_delay(job.attempts)
+                    self.log.info(
+                        "job.retry id=%s delay=%.3f next_attempt=%d",
+                        job.id,
+                        delay,
+                        job.attempts + 1,
                     )
                     _requeue_later(self.storage, job, delay)
+                else:
+                    self.log.error(
+                        "job.success id=%s name=%s attempt=%d",
+                        job.id,
+                        job.func_name,
+                        job.attempts,
+                    )
+
+
+class PinionError(Exception):
+    pass
+
+
+class TaskNotFound(PinionError):
+    pass
+
+
+class TaskExecutionError(PinionError):
+    pass
 
 
 # ---------- Demo tasks ----------
@@ -178,6 +221,9 @@ def fail() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     s = InMemoryStorage()
     w = Worker(s)
     t = threading.Thread(target=w.run_forever, daemon=True)
@@ -186,7 +232,7 @@ if __name__ == "__main__":
     s.enqueue(Job("add", (1, 2)))
     s.enqueue(Job("BOOM"))  # proves case-insensitive lookup
 
-    time.sleep(2.2)  # give retries a moment to show
+    time.sleep(4.5)  # give retries a moment to show
     w.stop()
     t.join()
     print("done; q size:", s.size())
