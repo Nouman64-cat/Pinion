@@ -1,6 +1,6 @@
 site_name: Pinion
 site_description: Tiny, pluggable Python job queue with retries and SQLite backend.
-site_url: https://github.com/Nouman64-cat/Pinion
+site_url: https://nouman64-cat.github.io/Pinion/
 repo_url: https://github.com/Nouman64-cat/Pinion
 repo_name: Nouman64-cat/Pinion
 theme: readthedocs
