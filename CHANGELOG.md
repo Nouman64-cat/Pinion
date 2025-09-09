@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.7 — Typing marker
+
+- Add PEP 561 marker file `pinion/py.typed` and include it in wheels/sdists so type checkers (e.g., mypy, pyright) recognize Pinion as typed.
+
 ## 0.2.6 — CLI quickstart fix + improved demo
 
 - Fix: crash when running `pinion` due to unescaped braces in the quickstart guide string. Switched to safe formatting and escaped examples.

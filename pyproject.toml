@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pinion-queue"
-version = "0.2.6"
+version = "0.2.7"
 description = "Pinion: a tiny pluggable job queue with retries."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,6 +29,7 @@ pinion-queue = "pinion.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pinion"]
+force-include = { "pinion/py.typed" = "pinion/py.typed" }
 
 [tool.hatch.build.targets.sdist]
 include = [
