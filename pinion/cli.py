@@ -60,6 +60,9 @@ def main() -> None:
     parser.add_argument(
         "--no-update-check", action="store_true", help="disable update check"
     )
+    parser.add_argument(
+        "--demo", action="store_true", help="run a tiny in-memory demo and exit"
+    )
     args = parser.parse_args()
 
     if args.version:
@@ -68,24 +71,54 @@ def main() -> None:
 
     _maybe_check_update(no_check=args.no_update_check)
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    # If --demo requested, run the tiny in-memory demonstration
+    if args.demo:
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+        )
 
-    @task()  # so users see it do something
-    def add(a: int, b: int) -> int:
-        out = a + b
-        print(f"add -> {out}")
-        return out
+        @task()  # so users see it do something
+        def add(a: int, b: int) -> int:
+            out = a + b
+            print(f"add -> {out}")
+            return out
 
-    s = InMemoryStorage()
-    w = Worker(s, retry=RetryPolicy(jitter=False))
-    t = threading.Thread(target=w.run_forever, daemon=True)
-    t.start()
-    s.enqueue(Job("add", (1, 2)))
+        s = InMemoryStorage()
+        w = Worker(s, retry=RetryPolicy(jitter=False))
+        t = threading.Thread(target=w.run_forever, daemon=True)
+        t.start()
+        s.enqueue(Job("add", (1, 2)))
+        try:
+            time.sleep(2.0)
+        finally:
+            w.stop()
+            t.join()
+        return
 
-    try:
-        time.sleep(2.0)
-    finally:
-        w.stop()
-        t.join()
+    # Otherwise, print a concise CLI guide and exit
+    guide = f"""
+Pinion {__version__}
+
+Quickstart (library):
+  In-memory:
+    from pinion import task, Job, InMemoryStorage, Worker, RetryPolicy
+    @task()\ndef add(a,b): return a+b
+    s=InMemoryStorage(); w=Worker(s, retry=RetryPolicy(jitter=False))
+    import threading; threading.Thread(target=w.run_forever, daemon=True).start()
+    s.enqueue(Job("add", (1,2)))
+
+  Durable (SQLite):
+    from pinion import task, Job, Worker, RetryPolicy, SqliteStorage
+    @task()\ndef hello(name): print("hi", name)
+    s=SqliteStorage("pinion.db"); w=Worker(s, retry=RetryPolicy())
+    # start worker thread/process then enqueue jobs; inspect dlq via s._conn
+
+CLI tips:
+  Show version:      pinion --version
+  Run tiny demo:     pinion --demo
+  Disable update chk: PINION_NO_UPDATE_CHECK=1 or pinion --no-update-check
+
+Docs: README.md • Changelog: CHANGELOG.md • PyPI: pinion-queue
+"""
+    print(guide.strip())
+    return
