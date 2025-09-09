@@ -25,12 +25,24 @@ Pinion is a tiny, pluggable job queue and worker for Python. It provides a simpl
 
 ## Quick Start
 
-### CLI demo
+### CLI
 
-Run the bundled demo (registers a simple `add` task and processes one job):
+- `pinion` prints a concise quickstart, admin command cheatsheet, and exits.
+- `pinion --demo` runs a tiny in-memory demo (adds 1+2).
+- SQLite admin commands: `status`, `running`, `pending`, `dlq-list`, `dlq-replay`, `enqueue`, `worker`.
+
+Examples:
 
 ```bash
-pinion
+# Show queue summary for a DB
+pinion status --db pinion.db
+
+# Run a worker for 5s and import your task module for registration
+pinion worker --db pinion.db --max-retries 2 --task-timeout 5 \
+  --import your_project.tasks --run-seconds 5
+
+# Enqueue a job by name with JSON args/kwargs
+pinion enqueue add --db pinion.db --args '[1,2]'
 ```
 
 ### Library usage (in-memory)
@@ -62,8 +74,7 @@ print(worker.metrics)
 
 ```python
 import threading, time
-from pinion import task, Job, Worker, RetryPolicy
-from pinion.queue import SqliteStorage  # durable backend
+from pinion import task, Job, Worker, RetryPolicy, SqliteStorage  # durable backend
 
 @task("boom")
 def fail() -> None:
