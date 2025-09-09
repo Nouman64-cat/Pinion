@@ -177,6 +177,16 @@ If `pinion-queue` is not available on PyPI, choose an alternative name or organi
 - `pinion/queue.py` — core queue, worker, storages, demo tasks
 - `pinion/cli.py` — simple CLI demo (`pinion`)
 
+## Upgrading
+
+- pip: `pip install -U pinion-queue`
+- pipx: `pipx upgrade pinion-queue`
+- Poetry: `poetry update pinion-queue`
+
+The CLI performs a lightweight update check (with a short timeout) and prints a hint if a newer version is available. Disable via `PINION_NO_UPDATE_CHECK=1` or `pinion --no-update-check`.
+
+See the Changelog for release notes: `CHANGELOG.md`.
+
 ---
 
 Pinion aims to be a tiny, understandable foundation you can extend with a real storage backend and operational features as needed.
