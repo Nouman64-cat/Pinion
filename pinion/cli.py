@@ -232,8 +232,8 @@ def main() -> None:
             return
 
     # Otherwise, print a concise CLI guide and exit
-    guide = f"""
-Pinion {__version__}
+    guide = """
+Pinion {version}
 
 Quickstart (library):
   In-memory:
@@ -255,7 +255,7 @@ Admin (SQLite):
   pinion pending --db pinion.db --limit 10
   pinion dlq-list --db pinion.db --limit 10
   pinion dlq-replay --db pinion.db --limit 10
-  pinion enqueue TASK --db pinion.db --args '[]' --kwargs '{}'
+  pinion enqueue TASK --db pinion.db --args '[]' --kwargs '{{}}'
   pinion worker --db pinion.db --max-retries 2 --task-timeout 5 \
     --import your_project.tasks  # import modules to register tasks
 
@@ -265,6 +265,6 @@ CLI tips:
   Disable update chk: PINION_NO_UPDATE_CHECK=1 or pinion --no-update-check
 
 Docs: README.md • Changelog: CHANGELOG.md • PyPI: pinion-queue
-"""
+""".format(version=__version__)
     print(guide.strip())
     return
