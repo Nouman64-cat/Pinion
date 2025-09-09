@@ -1,0 +1,30 @@
+site_name: Pinion
+site_description: Tiny, pluggable Python job queue with retries and SQLite backend.
+site_url: https://github.com/Nouman64-cat/Pinion
+repo_url: https://github.com/Nouman64-cat/Pinion
+repo_name: Nouman64-cat/Pinion
+theme: readthedocs
+extra_css:
+  - assets/stylesheets/extra.css
+plugins:
+  - search
+nav:
+  - Overview: index.md
+  - Quickstart: quickstart.md
+  - Concepts: concepts.md
+  - Usage:
+      - In-Memory Queue: usage/in-memory.md
+      - SQLite Backend: usage/sqlite.md
+      - CLI Reference: cli.md
+  - API:
+      - Job: api/job.md
+      - Storage SPI: api/storage.md
+      - InMemoryStorage: api/inmemory.md
+      - SqliteStorage: api/sqlite.md
+      - Worker: api/worker.md
+      - RetryPolicy: api/retry.md
+      - Tasks & Registry: api/tasks.md
+  - Examples: examples.md
+  - FAQ: faq.md
+  - Contributing: contributing.md
+  - Changelog: changelog.md

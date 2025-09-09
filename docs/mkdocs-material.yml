@@ -1,0 +1,55 @@
+INHERIT: mkdocs.yml
+
+theme:
+  name: material
+  logo: img/favicon.ico
+  favicon: img/favicon.ico
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.footer
+    - toc.integrate
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.action.edit
+    - content.code.copy
+    - content.tabs.link
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Nouman64-cat/Pinion
+      name: GitHub
+    - icon: simple/pypi
+      link: https://pypi.org/project/pinion-queue/
+      name: PyPI
+
+# Optional plugins (install before uncommenting)
+# plugins:
+#   - search
+#   - minify
+#   - git-revision-date-localized:
+#       type: date
+#   - mkdocstrings:
+#       handlers:
+#         python:
+#           options:
+#             show_source: false
+

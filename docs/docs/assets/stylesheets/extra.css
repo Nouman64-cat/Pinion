@@ -1,0 +1,25 @@
+/* Subtle tweaks to polish the Material theme */
+
+/* Improve code block readability */
+:root {
+  --md-code-hl-number-color: #c18401;
+  --md-code-hl-keyword-color: #8957e5;
+  --md-code-hl-string-color: #0a7f5a;
+  --md-primary-fg-color: #3f51b5; /* align with indigo palette */
+}
+
+/* Tighten paragraphs slightly for dense technical pages */
+.md-typeset p {
+  line-height: 1.55;
+}
+
+/* Make admonition titles a bit more pronounced */
+.md-typeset .admonition-title, .md-typeset summary {
+  font-weight: 600;
+}
+
+/* Footer spacing */
+.md-footer {
+  padding-top: 0.4rem;
+}
+
