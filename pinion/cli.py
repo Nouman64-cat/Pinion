@@ -112,22 +112,33 @@ def main() -> None:
             level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
         )
 
-        @task()  # so users see it do something
-        def add(a: int, b: int) -> int:
-            out = a + b
-            print(f"add -> {out}")
-            return out
+        # Professional, deterministic demo: a greeting and a transient failure that retries once.
+        @task("greet")
+        def greet(name: str) -> None:
+            print(f"[demo] Hello, {name}!")
+
+        _state = {"seen": 0}
+
+        @task("transient")
+        def transient() -> None:
+            _state["seen"] += 1
+            if _state["seen"] == 1:
+                raise RuntimeError("transient error (will succeed on retry)")
+            print("[demo] transient -> succeeded on retry")
 
         s = InMemoryStorage()
-        w = Worker(s, retry=RetryPolicy(jitter=False))
+        w = Worker(s, retry=RetryPolicy(max_retries=1, jitter=False, base_delay=0.3))
         t = threading.Thread(target=w.run_forever, daemon=True)
         t.start()
-        s.enqueue(Job("add", (1, 2)))
+        # Enqueue a greeting and a transient failure to showcase retry and success
+        s.enqueue(Job("greet", ("Pinion user",)))
+        s.enqueue(Job("transient"))
         try:
             time.sleep(2.0)
         finally:
             w.stop()
             t.join()
+            print("metrics:", w.metrics)
         return
 
     # SQLite admin subcommands
@@ -234,6 +245,8 @@ def main() -> None:
     # Otherwise, print a concise CLI guide and exit
     guide = """
 Pinion {version}
+
+Author: Nouman Ejaz
 
 Quickstart (library):
   In-memory:

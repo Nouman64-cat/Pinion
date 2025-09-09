@@ -2,19 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.2.5 — CLI quickstart fix
+## 0.2.6 — CLI quickstart fix + improved demo
 
 - Fix: crash when running `pinion` due to unescaped braces in the quickstart guide string. Switched to safe formatting and escaped examples.
+- Demo: `pinion --demo` now shows a professional, deterministic demo (greet + transient retry) and prints metrics.
+- Quickstart: includes author credit (Nouman Ejaz).
 - No API changes. Recommended update for anyone using the CLI.
 
-## 0.2.4 — CLI quickstart + admin tools
+## 0.2.5 — CLI admin tools + worker
 
-- CLI: default execution now prints a concise quickstart guide instead of running a demo.
 - CLI: added useful SQLite admin subcommands:
   - `status`, `running`, `pending`, `dlq-list`, `dlq-replay`, `enqueue`.
 - CLI: added `worker` subcommand to run a worker against a SQLite DB with flags for retries/timeouts and optional module imports for task registration.
-- CLI: retained `--demo` for the tiny in-memory example; `--version` and update check remain.
+- CLI: quickstart updated to include admin cheat sheet.
 - Docs: README updated with CLI usage examples.
+
+## 0.2.4 — CLI quickstart by default
+
+- CLI: default execution now prints a concise quickstart guide instead of running a demo.
+- CLI: retained `--demo` for a minimal example; `--version` and update check remain.
 
 ## 0.2.3 — Update notice + docs
 
