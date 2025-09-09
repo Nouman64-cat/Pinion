@@ -4,7 +4,7 @@ def main() -> None:
     from pathlib import Path
     from . import __version__
     from .queue import InMemoryStorage, Worker, RetryPolicy, Job, task
-
+# 
     def _parse_version(v: str) -> tuple[int, ...] | None:
         try:
             parts = []
