@@ -63,6 +63,41 @@ def main() -> None:
     parser.add_argument(
         "--demo", action="store_true", help="run a tiny in-memory demo and exit"
     )
+    # Admin subcommands (SQLite only)
+    sub = parser.add_subparsers(dest="cmd")
+    p = sub.add_parser("status", help="show queue and DLQ summary (SQLite)")
+    p.add_argument("--db", default="pinion.db")
+    p = sub.add_parser("running", help="list RUNNING jobs (SQLite)")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("pending", help="list PENDING jobs (SQLite)")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("dlq-list", help="list DLQ entries (SQLite)")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("dlq-replay", help="re-enqueue items from DLQ (SQLite)")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--limit", type=int, default=10)
+    p = sub.add_parser("enqueue", help="enqueue a task by name (SQLite)")
+    p.add_argument("task", help="task name")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--args", help="JSON list of positional args")
+    p.add_argument("--kwargs", help="JSON dict of keyword args")
+    p = sub.add_parser("worker", help="run a worker for a SQLite DB")
+    p.add_argument("--db", default="pinion.db")
+    p.add_argument("--max-retries", type=int, default=3)
+    p.add_argument("--base-delay", type=float, default=0.5)
+    p.add_argument("--no-jitter", action="store_true")
+    p.add_argument("--task-timeout", type=float, default=0.0)
+    p.add_argument("--visibility-timeout", type=float, default=10.0)
+    p.add_argument("--run-seconds", type=float, default=0.0)
+    p.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        help="Python module(s) to import for task registration (repeatable)",
+    )
     args = parser.parse_args()
 
     if args.version:
@@ -95,6 +130,107 @@ def main() -> None:
             t.join()
         return
 
+    # SQLite admin subcommands
+    # These require no task registration and work against an existing DB.
+    if args.cmd in {"status", "running", "pending", "dlq-list", "dlq-replay", "enqueue", "worker"}:
+        import json as _json
+        from . import SqliteStorage, Job as _Job, RetryPolicy as _RetryPolicy, Worker as _Worker
+        import importlib as _importlib
+        import logging as _logging
+        import threading as _threading
+        import time as _time
+
+        db = getattr(args, "db", "pinion.db")
+        s = SqliteStorage(db)
+        if args.cmd == "status":
+            qsize = s.size()
+            counts = s._conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status;").fetchall()
+            dlq = s._conn.execute("SELECT COUNT(*) FROM dlq;").fetchone()[0]
+            print("queue size:", qsize)
+            print("jobs by status:", dict(counts))
+            print("dlq count:", dlq)
+            return
+        if args.cmd == "running":
+            rows = s._conn.execute(
+                "SELECT id, func_name, attempts, heartbeat_at, created_at FROM jobs WHERE status='RUNNING' ORDER BY heartbeat_at DESC NULLS LAST, created_at DESC LIMIT ?;",
+                (args.limit,),
+            ).fetchall()
+            for r in rows:
+                print(r)
+            if not rows:
+                print("(none)")
+            return
+        if args.cmd == "pending":
+            rows = s._conn.execute(
+                "SELECT id, func_name, attempts, created_at FROM jobs WHERE status='PENDING' ORDER BY created_at ASC LIMIT ?;",
+                (args.limit,),
+            ).fetchall()
+            for r in rows:
+                print(r)
+            if not rows:
+                print("(none)")
+            return
+        if args.cmd == "dlq-list":
+            rows = s._conn.execute(
+                "SELECT id, func_name, attempts, error, failed_at FROM dlq ORDER BY failed_at DESC LIMIT ?;",
+                (args.limit,),
+            ).fetchall()
+            for r in rows:
+                print(r)
+            if not rows:
+                print("(empty)")
+            return
+        if args.cmd == "dlq-replay":
+            rows = s._conn.execute(
+                "SELECT id, func_name, args, kwargs FROM dlq ORDER BY failed_at ASC LIMIT ?;",
+                (args.limit,),
+            ).fetchall()
+            count = 0
+            for _id, func_name, ajson, kjson in rows:
+                args_tuple = tuple(_json.loads(ajson))
+                kwargs_dict = _json.loads(kjson)
+                s.enqueue(_Job(func_name, args_tuple, kwargs_dict))
+                s._conn.execute("DELETE FROM dlq WHERE id=?;", (_id,))
+                count += 1
+            print(f"replayed {count} job(s)")
+            return
+        if args.cmd == "enqueue":
+            pos_args = tuple(_json.loads(args.args) if getattr(args, "args", None) else [])
+            kw_args = _json.loads(args.kwargs) if getattr(args, "kwargs", None) else {}
+            s.enqueue(_Job(args.task, pos_args, kw_args))
+            print(f"enqueued {args.task} -> args={pos_args} kwargs={kw_args}")
+            return
+        if args.cmd == "worker":
+            # Optional imports to register tasks in this process
+            if getattr(args, "imports", None):
+                for mod in args.imports:
+                    try:
+                        _importlib.import_module(mod)
+                    except Exception as e:
+                        print(f"failed to import {mod!r}: {e}")
+            _logging.basicConfig(level=_logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+            retry = _RetryPolicy(max_retries=args.max_retries, base_delay=args.base_delay, jitter=not args.no_jitter)
+            w = _Worker(s, retry=retry, poll_timeout=0.1, task_timeout=args.task_timeout, visibility_timeout=args.visibility_timeout)
+            if args.run_seconds and args.run_seconds > 0:
+                t = _threading.Thread(target=w.run_forever, daemon=True)
+                t.start()
+                try:
+                    _time.sleep(args.run_seconds)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    w.stop(); t.join(); w.join(1.0)
+                    print("metrics:", w.metrics)
+            else:
+                try:
+                    w.run_forever()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    w.stop(); w.join(1.0)
+                    print("metrics:", w.metrics)
+            return
+
     # Otherwise, print a concise CLI guide and exit
     guide = f"""
 Pinion {__version__}
@@ -112,6 +248,16 @@ Quickstart (library):
     @task()\ndef hello(name): print("hi", name)
     s=SqliteStorage("pinion.db"); w=Worker(s, retry=RetryPolicy())
     # start worker thread/process then enqueue jobs; inspect dlq via s._conn
+
+Admin (SQLite):
+  pinion status --db pinion.db
+  pinion running --db pinion.db --limit 10
+  pinion pending --db pinion.db --limit 10
+  pinion dlq-list --db pinion.db --limit 10
+  pinion dlq-replay --db pinion.db --limit 10
+  pinion enqueue TASK --db pinion.db --args '[]' --kwargs '{}'
+  pinion worker --db pinion.db --max-retries 2 --task-timeout 5 \
+    --import your_project.tasks  # import modules to register tasks
 
 CLI tips:
   Show version:      pinion --version
