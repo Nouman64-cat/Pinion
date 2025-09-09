@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.2.6 — CLI quickstart fix
+## 0.2.5 — CLI quickstart fix
 
 - Fix: crash when running `pinion` due to unescaped braces in the quickstart guide string. Switched to safe formatting and escaped examples.
 - No API changes. Recommended update for anyone using the CLI.
