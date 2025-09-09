@@ -3,3 +3,5 @@ tests/
 *.pyc
 *.whl
 *.tar.gz
+test-project/
+scripts/
