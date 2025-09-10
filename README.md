@@ -45,6 +45,14 @@ pinion worker --db pinion.db --max-retries 2 --task-timeout 5 \
 pinion enqueue add --db pinion.db --args '[1,2]'
 ```
 
+## Documentation
+
+- Local preview with MkDocs:
+  - `pip install mkdocs mkdocs-material`
+  - From repo root: `mkdocs serve --config-file docs/mkdocs-material.yml`
+  - Or `cd docs` then: `mkdocs serve -f mkdocs-material.yml`
+  - Open the URL printed by MkDocs (e.g., `http://127.0.0.1:8000/`).
+
 ### Library usage (in-memory)
 
 ```python
