@@ -26,9 +26,10 @@ Methods:
 
 Timeouts:
 
-- If `task_timeout` > 0, tasks execute in a helper thread and are marked failed if they exceed the timeout (thread isn’t forcibly killed).
+- If `task_timeout` > 0, tasks execute in a helper thread and are marked failed if they exceed the timeout (the thread isn't forcibly killed).
 
 Retries:
 
-- Failures are retried while attempts ≤ `max_retries` using `RetryPolicy.compute_delay`.
+- Failures are retried while attempts <= `max_retries` using `RetryPolicy.compute_delay`.
+
 
