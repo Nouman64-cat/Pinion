@@ -10,14 +10,34 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{ name = "Nouman Ejaz", email = "working.nouman.ejaz@gmail.com" }]
+keywords = ["job queue", "worker", "retry", "sqlite", "task registry"]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: System :: Distributed Computing",
   "Typing :: Typed"
 ]
 dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "mkdocs>=1.5",
+  "mkdocs-material>=9.5",
+]
+
+docs = [
+  "mkdocs>=1.5",
+  "mkdocs-material>=9.5",
+]
+
+tests = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/Nouman64-cat/Pinion"

@@ -8,6 +8,15 @@ pip install -e .
 
 CLI entry points: `pinion` and `pinion-queue`.
 
+### Run the tests
+
+```bash
+pip install -e ".[tests]"
+pytest -q
+```
+
+Use the `.[dev]` extra if you also want the MkDocs tooling installed alongside the test suite.
+
 !!! tip "Pretty docs locally"
     To use the Material theme variant, install:
 

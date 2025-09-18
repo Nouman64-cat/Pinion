@@ -12,7 +12,7 @@ from .types import Job, Status
 class SqliteStorage:
     def __init__(self, path: str = "pinion.db") -> None:
         self._cv = threading.Condition()  # local process wakeups
-        self._lock = threading.RLock()    # serialize access to sqlite connection
+        self._lock = threading.RLock()  # serialize access to sqlite connection
         self._conn = sqlite3.connect(
             path, isolation_level=None, check_same_thread=False
         )
@@ -201,4 +201,3 @@ class SqliteStorage:
                     time.time(),
                 ),
             )
-
