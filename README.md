@@ -48,10 +48,27 @@ pinion enqueue add --db pinion.db --args '[1,2]'
 ## Documentation
 
 - Local preview with MkDocs:
-  - `pip install mkdocs mkdocs-material`
+  - `pip install -e .[docs]` (or install `mkdocs` and `mkdocs-material` manually)
   - From repo root: `mkdocs serve --config-file docs/mkdocs-material.yml`
   - Or `cd docs` then: `mkdocs serve -f mkdocs-material.yml`
   - Open the URL printed by MkDocs (e.g., `http://127.0.0.1:8000/`).
+
+## Running Tests
+
+- Install extras that include the testing tools: `pip install -e ".[tests]"` (or use `.[dev]` for docs + tests).
+- From the project root, run the suite with `pytest` (append `-q` for quiet output, `--cov` for coverage).
+- Tests expect a local SQLite database file for backend checks and create/delete temporary files automatically.
+
+## Tested Guarantees
+
+The automated test suite captures the core behaviours you rely on in production:
+
+- Jobs begin life as `Status.PENDING` with `attempts == 0`, and in-memory queues report their length via `InMemoryStorage.size()`.
+- Claiming a job through either storage backend moves it to `RUNNING`, increments `attempts`, and `mark_done` persists a `SUCCESS` state (SQLite verified at the schema level).
+- Stale or failed work is recovered: `reap_stale` requeues timed-out jobs and both storages funnel exhausted retries into a dead-letter queue.
+- Task registration is case-insensitive, so `@task()` without arguments registers handlers by their lowercase function name.
+- `RetryPolicy.compute_delay()` delivers deterministic exponential backoff when jitter is disabled and uniform jitter when enabled.
+- Worker metrics track successes, retries, dead-letter events, and respect optional per-task timeouts while continuing to poll for work.
 
 ### Library usage (in-memory)
 

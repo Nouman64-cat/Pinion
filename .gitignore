@@ -1,5 +1,4 @@
 *.db
-tests/
 *.pyc
 *.whl
 *.tar.gz

@@ -1,11 +1,16 @@
 site_name: Pinion
-site_description: Tiny, pluggable Python job queue with retries and SQLite backend.
+site_description: Tiny, pluggable Python job queue with retries, SQLite durability, and a tested worker lifecycle.
 site_url: https://nouman64-cat.github.io/Pinion/
 repo_url: https://github.com/Nouman64-cat/Pinion
 repo_name: Nouman64-cat/Pinion
 theme: readthedocs
 extra_css:
   - assets/stylesheets/extra.css
+extra:
+  tested_guarantees:
+    - Jobs start `PENDING` with zero attempts and storage size reflects queued work.
+    - `dequeue` promotes jobs to `RUNNING`, increments attempts, and `mark_done` persists success (verified for SQLite).
+    - Both storages requeue stale jobs or dead-letter exhausted retries, and worker metrics capture each outcome.
 plugins:
   - search
 nav:
